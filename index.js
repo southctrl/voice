@@ -482,6 +482,7 @@ class Connection extends EventEmitter {
     this.udpKeepAliveInterval = null
     this.udpInfo = null
     this.udp = null
+    this._udpClosedIntentionally = false
 
     this.ping = -1
     this.statistics = { packetsSent: 0, packetsLost: 0, packetsExpected: 0 }
@@ -1100,7 +1101,9 @@ class Connection extends EventEmitter {
     })
 
     this.ws.on('close', (code, reason) => {
-      if (!this.ws) return
+      const ws = this.ws
+      if (!ws) return
+      this.ws = null
 
       const closeCode = DISCORD_CLOSE_CODES[code]
 
@@ -1147,6 +1150,184 @@ class Connection extends EventEmitter {
     }
   }
 
+  _createUdpSocket() {
+    if (this.udp) {
+      this._udpClosedIntentionally = true
+      try { this.udp.close() } catch {}
+      this.udp.removeAllListeners()
+      this.udp = null
+      this._udpClosedIntentionally = false
+    }
+
+    const udp = dgram.createSocket('udp4')
+    this.udp = udp
+    this._udpClosedIntentionally = false
+
+    udp.on('message', (data) => {
+      if (this.udp !== udp) return
+      if (data.length <= 12) return
+
+      const rtpVersion = data[0] >> 6
+      if (rtpVersion !== 2) return
+
+      const payloadType = data[1] & 0x7f
+      if (payloadType !== 0x78) return
+
+      const ssrc = data.readUInt32BE(8)
+      const userData = this.ssrcs.get(ssrc)
+      if (!userData || !this.udpInfo?.secretKey) return
+
+      const hasPadding = !!(data[0] & 0b100000)
+      const hasExtension = !!(data[0] & 0b10000)
+      const cc = data[0] & 0b1111
+
+      const nonce =
+        this.encryption === 'aead_aes256_gcm_rtpsize'
+          ? this._recvNonce12
+          : this._recvNonce24
+
+      nonce.fill(0)
+      data.copy(nonce, 0, data.length - 4, data.length)
+
+      let headerSize = 12 + cc * 4
+      let extensionLengthInWords = 0
+      if (data.length < headerSize) return
+
+      if (hasExtension) {
+        if (data.length < headerSize + 4) return
+        extensionLengthInWords = data.readUInt16BE(headerSize + 2)
+        headerSize += 4
+      }
+
+      const header = data.subarray(0, headerSize)
+
+      let decryptedPacket
+
+      if (this.encryption === 'aead_aes256_gcm_rtpsize') {
+        const trailerLength = 16 + 4
+        if (data.length < headerSize + trailerLength) return
+
+        const encrypted = data.subarray(
+          headerSize,
+          data.length - trailerLength
+        )
+        const authTag = data.subarray(
+          data.length - trailerLength,
+          data.length - 4
+        )
+
+        try {
+          const decipher = crypto.createDecipheriv(
+            'aes-256-gcm',
+            this.udpInfo.secretKey,
+            nonce
+          )
+          decipher.setAAD(header)
+          decipher.setAuthTag(authTag)
+          const u = decipher.update(encrypted)
+          const f = decipher.final()
+          decryptedPacket = Buffer.allocUnsafe(u.length + f.length)
+          u.copy(decryptedPacket, 0)
+          f.copy(decryptedPacket, u.length)
+        } catch (e) {
+          this.emit(
+            'error',
+            new Error(`Failed to decrypt AES-256-GCM packet: ${e.message}`)
+          )
+          return
+        }
+      } else if (this.encryption === 'aead_xchacha20_poly1305_rtpsize') {
+        if (data.length < headerSize + 4) return
+
+        const encrypted = data.subarray(headerSize, data.length - 4)
+        try {
+          decryptedPacket =
+            Sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
+              encrypted,
+              header,
+              nonce,
+              this.udpInfo.secretKey
+            )
+        } catch (e) {
+          this.emit(
+            'error',
+            new Error(
+              `Failed to decrypt XChaCha20-Poly1305 packet: ${e.message}`
+            )
+          )
+          return
+        }
+      } else {
+        return
+      }
+
+      if (!decryptedPacket || decryptedPacket.length === 0) return
+
+      if (hasPadding) {
+        const paddingAmount = decryptedPacket.readUInt8(
+          decryptedPacket.length - 1
+        )
+        if (paddingAmount > 0) {
+          if (paddingAmount >= decryptedPacket.length) return
+          decryptedPacket = decryptedPacket.subarray(
+            0,
+            decryptedPacket.length - paddingAmount
+          )
+        }
+      }
+
+      const extensionDataLength = extensionLengthInWords * 4
+      if (hasExtension) {
+        if (extensionDataLength > decryptedPacket.length) return
+        decryptedPacket = decryptedPacket.subarray(extensionDataLength)
+      }
+
+      let packet = decryptedPacket
+
+      if (this.mlsSession && userData.userId) {
+        const decrypted = this.mlsSession.decrypt(packet, userData.userId)
+        if (decrypted !== null) packet = decrypted
+        else return
+      }
+
+      if (packet.equals(OPUS_SILENCE_FRAME)) {
+        if (userData.stream.destroyed || userData.stream.writableEnded) return
+        this.emit('speakEnd', userData.userId, ssrc)
+        userData.stream.end()
+      } else {
+        if (
+          userData.stream.readableEnded ||
+          userData.stream.writableEnded ||
+          userData.stream.destroyed
+        ) {
+          userData.stream = new PassThrough({ objectMode: true })
+          this.emit('speakStart', userData.userId, ssrc)
+        }
+        try {
+          userData.stream.write(packet)
+        } catch {
+          userData.stream = new PassThrough({ objectMode: true })
+          this.emit('speakStart', userData.userId, ssrc)
+          userData.stream.write(packet)
+        }
+      }
+    })
+
+    udp.on('error', (error) => {
+      if (this.udp !== udp) return
+      this.emit('error', error)
+    })
+
+    udp.on('close', () => {
+      if (this.udp !== udp) return
+      if (this._udpClosedIntentionally) return
+      if (!this.ws) return
+      this._destroy({ status: 'disconnected' }, false)
+    })
+
+    return udp
+  }
+
   async _handleJSON(payload, cb) {
     switch (payload.op) {
       case 2: {
@@ -1157,163 +1338,7 @@ class Connection extends EventEmitter {
           secretKey: null
         }
 
-        this.udp = dgram.createSocket('udp4')
-
-        this.udp.on('message', (data) => {
-          if (data.length <= 12) return
-
-          const rtpVersion = data[0] >> 6
-          if (rtpVersion !== 2) return
-
-          const payloadType = data[1] & 0x7f
-          if (payloadType !== 0x78) return
-
-          const ssrc = data.readUInt32BE(8)
-          const userData = this.ssrcs.get(ssrc)
-          if (!userData || !this.udpInfo?.secretKey) return
-
-          const hasPadding = !!(data[0] & 0b100000)
-          const hasExtension = !!(data[0] & 0b10000)
-          const cc = data[0] & 0b1111
-
-          const nonce =
-            this.encryption === 'aead_aes256_gcm_rtpsize'
-              ? this._recvNonce12
-              : this._recvNonce24
-
-          nonce.fill(0)
-          data.copy(nonce, 0, data.length - 4, data.length)
-
-          let headerSize = 12 + cc * 4
-          let extensionLengthInWords = 0
-          if (data.length < headerSize) return
-
-          if (hasExtension) {
-            if (data.length < headerSize + 4) return
-            extensionLengthInWords = data.readUInt16BE(headerSize + 2)
-            headerSize += 4
-          }
-
-          const header = data.subarray(0, headerSize)
-
-          let decryptedPacket
-
-          if (this.encryption === 'aead_aes256_gcm_rtpsize') {
-            const trailerLength = 16 + 4
-            if (data.length < headerSize + trailerLength) return
-
-            const encrypted = data.subarray(
-              headerSize,
-              data.length - trailerLength
-            )
-            const authTag = data.subarray(
-              data.length - trailerLength,
-              data.length - 4
-            )
-
-            try {
-              const decipher = crypto.createDecipheriv(
-                'aes-256-gcm',
-                this.udpInfo.secretKey,
-                nonce
-              )
-              decipher.setAAD(header)
-              decipher.setAuthTag(authTag)
-              const u = decipher.update(encrypted)
-              const f = decipher.final()
-              decryptedPacket = Buffer.allocUnsafe(u.length + f.length)
-              u.copy(decryptedPacket, 0)
-              f.copy(decryptedPacket, u.length)
-            } catch (e) {
-              this.emit(
-                'error',
-                new Error(`Failed to decrypt AES-256-GCM packet: ${e.message}`)
-              )
-              return
-            }
-          } else if (this.encryption === 'aead_xchacha20_poly1305_rtpsize') {
-            if (data.length < headerSize + 4) return
-
-            const encrypted = data.subarray(headerSize, data.length - 4)
-            try {
-              decryptedPacket =
-                Sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
-                  encrypted,
-                  header,
-                  nonce,
-                  this.udpInfo.secretKey
-                )
-            } catch (e) {
-              this.emit(
-                'error',
-                new Error(
-                  `Failed to decrypt XChaCha20-Poly1305 packet: ${e.message}`
-                )
-              )
-              return
-            }
-          } else {
-            return
-          }
-
-          if (!decryptedPacket || decryptedPacket.length === 0) return
-
-          if (hasPadding) {
-            const paddingAmount = decryptedPacket.readUInt8(
-              decryptedPacket.length - 1
-            )
-            if (paddingAmount > 0) {
-              if (paddingAmount >= decryptedPacket.length) return
-              decryptedPacket = decryptedPacket.subarray(
-                0,
-                decryptedPacket.length - paddingAmount
-              )
-            }
-          }
-
-          const extensionDataLength = extensionLengthInWords * 4
-          if (hasExtension) {
-            if (extensionDataLength > decryptedPacket.length) return
-            decryptedPacket = decryptedPacket.subarray(extensionDataLength)
-          }
-
-          let packet = decryptedPacket
-
-          if (this.mlsSession && userData.userId) {
-            const decrypted = this.mlsSession.decrypt(packet, userData.userId)
-            if (decrypted !== null) packet = decrypted
-            else return
-          }
-
-          if (packet.equals(OPUS_SILENCE_FRAME)) {
-            if (userData.stream.destroyed || userData.stream.writableEnded) return
-            this.emit('speakEnd', userData.userId, ssrc)
-            userData.stream.end()
-          } else {
-            if (
-              userData.stream.readableEnded ||
-              userData.stream.writableEnded ||
-              userData.stream.destroyed
-            ) {
-              userData.stream = new PassThrough({ objectMode: true })
-              this.emit('speakStart', userData.userId, ssrc)
-            }
-            try {
-              userData.stream.write(packet)
-            } catch {
-              userData.stream = new PassThrough({ objectMode: true })
-              this.emit('speakStart', userData.userId, ssrc)
-              userData.stream.write(packet)
-            }
-          }
-        })
-
-        this.udp.on('error', (error) => this.emit('error', error))
-
-        this.udp.on('close', () => {
-          if (!this.ws) return
-          this._destroy({ status: 'disconnected' })
-        })
+        this._createUdpSocket()
 
         let serverInfo
         try {
@@ -1326,6 +1351,8 @@ class Connection extends EventEmitter {
           )
           return
         }
+        
+        if (!this.udpInfo || !this.ws) return
 
         this._setupNativeQueue(this.udpInfo.ip, this.udpInfo.port)
 
@@ -1686,7 +1713,10 @@ class Connection extends EventEmitter {
         'finishBuffering',
         this._boundMarkAsStoppable
       )
-      this.audioStream.destroy()
+
+      if (!this.audioStream.destroyed) {
+        try { this.audioStream.destroy() } catch {}
+      }
       this.audioStream.removeAllListeners()
       this.audioStream = null
     }
@@ -1840,17 +1870,20 @@ class Connection extends EventEmitter {
 
     const ws = this.ws
     if (ws) {
+      this.ws = null
       try {
         if (!ws.closing) ws.close(code, reason)
       } catch {}
       ws.removeAllListeners()
-      this.ws = null
     }
 
     if (this.udp) {
-      this.udp.close()
-      this.udp.removeAllListeners()
+      this._udpClosedIntentionally = true
+      const udp = this.udp
       this.udp = null
+      try { udp.close() } catch {}
+      udp.removeAllListeners()
+      this._udpClosedIntentionally = false
     }
   }
 
@@ -1862,7 +1895,9 @@ class Connection extends EventEmitter {
     this.sessionId = null
 
     if (this.audioStream && destroyStream) {
-      this.audioStream.destroy()
+      if (!this.audioStream.destroyed) {
+        try { this.audioStream.destroy() } catch {}
+      }
       this.audioStream.removeAllListeners()
       this.audioStream = null
     }
